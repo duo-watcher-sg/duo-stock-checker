@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
 iPhone Duo stock checker - Apple Store Singapore
-Checks in-store pickup availability for iPhone Duo 512GB Star White
-and sends a push notification to your iPhone via the ntfy app.
+Checks whether iPhone Duo 512GB Star White is available for in-store pickup
+at any Apple Store in Singapore, and watches the online delivery date.
+Sends push notifications to your iPhone via the ntfy app.
 
 Uses only the Python standard library (no installs needed).
 
 Settings come from environment variables:
   NTFY_TOPIC   (required) your secret ntfy topic name
-  PART_NUMBERS (optional) comma-separated Apple part numbers to try
+  PART_NUMBER  (optional) Apple part number to watch
   STATE_FILE   (optional) where to remember the last result
   TEST_NOTIFY  (optional) set to "1" to send a test notification and exit
 """
@@ -23,13 +24,12 @@ import urllib.request
 
 # --- Settings -------------------------------------------------------------
 
-# Apple part number for iPhone Duo 512GB Star White (Singapore model).
-# Singapore models end in "ZP/A". The first number Apple recognises is used.
-DEFAULT_PARTS = "MK2F4ZP/A,MK2F4ZA/A"
+# Singapore part number for iPhone Duo 512GB Star White (from apple.com/sg).
+DEFAULT_PART = "MK2F4X/A"
 
 PRODUCT_NAME = "iPhone Duo 512GB Star White"
-BUY_URL = "https://www.apple.com/sg/shop/buy-iphone/iphone-duo"
-API_URL = "https://www.apple.com/sg/shop/fulfillment-messages"
+BUY_URL = "https://www.apple.com/sg/shop/buy-iphone/iphone-duo/7.6-inch-display-512gb-star-white"
+API_URL = "https://www.apple.com/sg/shop/sba/availability-message"
 NTFY_SERVER = "https://ntfy.sh"
 
 # Only warn about errors after this many failed checks in a row,
@@ -72,67 +72,48 @@ def notify(topic, title, message, priority="default", tags="", click=BUY_URL):
 # --- Apple availability ---------------------------------------------------
 
 def fetch_availability(part):
-    """Ask Apple which Singapore stores have this part for pickup."""
-    params = urllib.parse.urlencode({
-        "pl": "true",
-        "mts.0": "regular",
-        "parts.0": part,
-        "location": "Singapore",
-    })
+    """Ask Apple Singapore about pickup stock and delivery for this part."""
+    params = urllib.parse.urlencode({"parts.0": part})
     req = urllib.request.Request(f"{API_URL}?{params}", headers=HEADERS)
     with urllib.request.urlopen(req, timeout=20) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def parse_stores(data, part):
+def parse(data, part):
     """
-    Turn Apple's response into a list of stores.
-    Returns (recognised, stores) where stores is a list of
-    {"name", "available", "quote"}.
+    Pull out what we need from Apple's answer.
+    Returns None if Apple didn't recognise the part, otherwise a dict:
+      available (bool), stores (int), delivery (str), delivery_code (str)
     """
-    stores_raw = (
-        data.get("body", {})
-        .get("content", {})
-        .get("pickupMessage", {})
-        .get("stores", [])
-    )
-    stores = []
-    recognised = False
-    for s in stores_raw:
-        info = (s.get("partsAvailability") or {}).get(part)
-        if not info:
-            continue
-        recognised = True
-        display = (info.get("pickupDisplay") or "").lower()
-        quote = info.get("pickupSearchQuote") or info.get("storePickupQuote") or ""
-        stores.append({
-            "name": s.get("storeName") or s.get("storeNumber") or "Apple Store",
-            "available": display == "available",
-            "quote": quote,
-        })
-    return recognised, stores
+    content = (data.get("body") or {}).get("content") or []
+    item = next((c for c in content if c.get("partNumber") == part), None)
+    if item is None:
+        return None
+    delivery_msg = item.get("deliveryMessage") or {}
+    options = delivery_msg.get("deliveryOptions") or []
+    delivery = options[0].get("date", "") if options else ""
+    return {
+        "available": bool(item.get("availableAtAnyStore")),
+        "stores": int(item.get("partAvailableStoresCount") or 0),
+        "delivery": delivery,
+        "delivery_code": item.get("encodedUpperDateString") or "",
+        "buyable": bool(delivery_msg.get("isBuyable", True)),
+    }
 
 
-def check():
-    """Try each candidate part number. Returns (part, stores)."""
-    parts = [p.strip() for p in os.environ.get("PART_NUMBERS", DEFAULT_PARTS).split(",") if p.strip()]
+def check(part):
     last_error = None
-    for part in parts:
-        for attempt in range(2):
-            try:
-                data = fetch_availability(part)
-                recognised, stores = parse_stores(data, part)
-                if recognised:
-                    return part, stores
-                print(f"Apple did not recognise part {part}")
-                break
-            except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as e:
-                last_error = e
-                print(f"Attempt {attempt + 1} for {part} failed: {e}")
-                time.sleep(5)
-    if last_error:
-        raise RuntimeError(f"Could not reach Apple: {last_error}")
-    raise LookupError("None of the part numbers were recognised by Apple Singapore")
+    for attempt in range(2):
+        try:
+            result = parse(fetch_availability(part), part)
+            if result is None:
+                raise LookupError(f"Apple Singapore did not recognise part {part}")
+            return result
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as e:
+            last_error = e
+            print(f"Attempt {attempt + 1} failed: {e}")
+            time.sleep(5)
+    raise RuntimeError(f"Could not reach Apple: {last_error}")
 
 
 # --- State (so you only get pinged when something changes) ----------------
@@ -163,19 +144,18 @@ def main():
                tags="white_check_mark")
         return
 
+    part = os.environ.get("PART_NUMBER", "").strip() or DEFAULT_PART
     state_path = os.environ.get("STATE_FILE", "state.json")
     state = load_state(state_path)
-    prev_available = set(state.get("available_stores", []))
     errors = state.get("consecutive_errors", 0)
 
     try:
-        part, stores = check()
+        r = check(part)
     except LookupError as e:
         print(e)
         if not state.get("part_warning_sent"):
             notify(topic, "Stock checker needs a fix",
-                   "Apple didn't recognise the part number for the 512GB Star White. "
-                   "Ask Claude to help update PART_NUMBERS.",
+                   f"Apple didn't recognise part {part}. Ask Claude to help update it.",
                    priority="high", tags="warning")
             state["part_warning_sent"] = True
         save_state(state_path, state)
@@ -194,28 +174,33 @@ def main():
     if errors >= ERROR_ALERT_AFTER:
         notify(topic, "Stock checker is working again", "Back to checking Apple.", tags="ok")
 
-    available = {s["name"] for s in stores if s["available"]}
-    print(f"Part {part}:")
-    for s in stores:
-        print(f"  {s['name']}: {'AVAILABLE' if s['available'] else 'not available'} {s['quote']}")
+    print(f"{PRODUCT_NAME} ({part})")
+    print(f"  Pickup in Singapore: {'AVAILABLE at ' + str(r['stores']) + ' store(s)' if r['available'] else 'not available at any store'}")
+    print(f"  Online delivery date: {r['delivery'] or 'unknown'}")
 
-    newly = available - prev_available
-    gone = prev_available - available
-
-    if newly:
-        lines = [f"- {s['name']}: {s['quote'] or 'available'}" for s in stores if s["name"] in newly]
+    was_available = state.get("available", False)
+    if r["available"] and not was_available:
         notify(topic, f"IN STOCK: {PRODUCT_NAME}",
-               "Available for pickup now:\n" + "\n".join(lines) + "\nTap to open the Apple Store.",
+               f"Available for pickup at {r['stores']} Apple Store(s) in Singapore. "
+               "Tap to open the Apple Store and choose Pick up.",
                priority="urgent", tags="rotating_light,iphone")
-    if gone and not available:
+    elif was_available and not r["available"]:
         notify(topic, "Sold out again",
-               f"{PRODUCT_NAME} is no longer available at: {', '.join(sorted(gone))}.",
+               f"{PRODUCT_NAME} is no longer available for pickup in Singapore.",
                priority="low", tags="x")
 
+    # Tell you if online delivery gets meaningfully earlier.
+    old_code = state.get("delivery_code", "")
+    if old_code and r["delivery_code"] and r["delivery_code"] < old_code:
+        notify(topic, "Delivery date moved earlier",
+               f"Online orders now deliver {r['delivery']} (was {state.get('delivery', old_code)}).",
+               tags="truck")
+
     save_state(state_path, {
-        "available_stores": sorted(available),
+        "available": r["available"],
+        "delivery": r["delivery"],
+        "delivery_code": r["delivery_code"],
         "consecutive_errors": 0,
-        "part": part,
         "checked_at": int(time.time()),
     })
 
