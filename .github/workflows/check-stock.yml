@@ -1,0 +1,42 @@
+name: Check iPhone Duo stock
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may run it a few minutes late)
+  workflow_dispatch:
+    inputs:
+      test_notify:
+        description: "Send a test notification to my iPhone"
+        type: boolean
+        default: false
+
+concurrency:
+  group: stock-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Remember last result
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: stock-state-${{ github.run_id }}
+          restore-keys: stock-state-
+
+      - name: Check Apple Singapore
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TEST_NOTIFY: ${{ inputs.test_notify && '1' || '0' }}
+        run: python3 check_stock.py
+
+      - name: Save result
+        if: always() && hashFiles('state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: stock-state-${{ github.run_id }}
